@@ -1,0 +1,123 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# pipeline.yml — perf-framework repo
+# Included by project repos via GitLab CI include keyword.
+# DO NOT edit this in project repos — modify in perf-framework repo only.
+# ══════════════════════════════════════════════════════════════════════════════
+
+stages:
+  - test
+  - report
+  - notify
+
+# ── Default settings ──────────────────────────────────────────────────────────
+default:
+  image: ubuntu:22.04
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 python3-pip openjdk-17-jre-headless wget unzip > /dev/null
+    - pip3 install pandas --break-system-packages -q
+    - |
+      if [ ! -d "$JMETER_HOME" ]; then
+        echo "Installing JMeter..."
+        wget -q https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.tgz
+        tar -xzf apache-jmeter-5.6.3.tgz
+        export JMETER_HOME=$(pwd)/apache-jmeter-5.6.3
+        export PATH=$JMETER_HOME/bin:$PATH
+      fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — RUN JMETER TEST
+# ══════════════════════════════════════════════════════════════════════════════
+
+run-test:
+  stage: test
+  script:
+    - mkdir -p results
+    - echo "[pipeline] Running JMeter test → $JMX_FILE"
+    - |
+      $JMETER_HOME/bin/jmeter -n \
+        -t $JMX_FILE \
+        -l results/raw.jtl \
+        -Jjmeter.save.saveservice.output_format=csv \
+        -Jjmeter.save.saveservice.print_field_names=true \
+        -e -o results/html_report \
+        2>&1 | tail -20
+    - echo "[pipeline] JMeter test complete"
+    - ls -lh results/
+  artifacts:
+    paths:
+      - results/
+    expire_in: 1 day           # temp — only needed between stages
+  rules:
+    - when: always
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — GENERATE DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+generate-report:
+  stage: report
+  needs: [run-test]
+  script:
+    - mkdir -p reports
+    - echo "[pipeline] Generating dashboard..."
+    - |
+      AGGREGATE_REPORT=$AGGREGATE_REPORT \
+      ERROR_LOG=$ERROR_LOG \
+      SLA_FILE=$SLA_FILE \
+      TEST_NAME="$TEST_NAME" \
+      REPORT_MODE=$REPORT_MODE \
+      GRAFANA_URL="$GRAFANA_URL" \
+      OUTPUT_DIR=reports \
+      python3 .perf-framework/generate_dashboard.py
+    - echo "[pipeline] Injecting AI insights..."
+    - |
+      ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+      OUTPUT_DIR=reports \
+      TEST_NAME="$TEST_NAME" \
+      python3 .perf-framework/claude_insights.py
+    - echo "[pipeline] Dashboard ready → reports/dashboard.html"
+    # Exit non-zero if FAIL result — blocks merge/deploy
+    - |
+      RESULT=$(python3 -c "import json; d=json.load(open('reports/summary.json')); print(d['overall_result'])")
+      echo "[pipeline] Overall Result: $RESULT"
+      if [ "$RESULT" = "FAIL" ] && [ "$FAIL_PIPELINE_ON_FAIL" = "true" ]; then
+        echo "[pipeline] ❌ Performance gate FAILED — blocking pipeline"
+        exit 1
+      fi
+  artifacts:
+    name: "perf-report-${CI_PIPELINE_ID}"
+    paths:
+      - reports/dashboard.html
+      - reports/summary.json
+      - $AGGREGATE_REPORT
+      - $ERROR_LOG
+    expose_as: "Performance Dashboard"
+    expire_in: $ARTIFACT_EXPIRE
+  rules:
+    - when: always
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 3 — SEND EMAIL
+# ══════════════════════════════════════════════════════════════════════════════
+
+send-email:
+  stage: notify
+  needs: [generate-report]
+  script:
+    - echo "[pipeline] Sending report email..."
+    - |
+      MAIL_TO="$MAIL_TO" \
+      MAIL_CC="$MAIL_CC" \
+      MAIL_SUBJECT_PREFIX="$MAIL_SUBJECT_PREFIX" \
+      SEND_MAIL_ON=$SEND_MAIL_ON \
+      TEST_NAME="$TEST_NAME" \
+      SMTP_HOST=$SMTP_HOST \
+      SMTP_PORT=$SMTP_PORT \
+      SMTP_USER=$SMTP_USER \
+      SMTP_PASSWORD=$SMTP_PASSWORD \
+      SMTP_SSL=$SMTP_SSL \
+      OUTPUT_DIR=reports \
+      python3 .perf-framework/send_report.py
+  rules:
+    - when: always          # always attempt notify — send_report.py handles conditions
+  allow_failure: true       # mail failure never breaks pipeline

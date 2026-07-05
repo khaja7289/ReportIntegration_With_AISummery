@@ -1,0 +1,64 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# .gitlab-ci.yml — perf-tests-lfg (project repo)
+# This is the ONLY file your team edits.
+# All pipeline logic lives in perf-framework repo.
+# ══════════════════════════════════════════════════════════════════════════════
+
+include:
+  - project: 'your-group/perf-framework'
+    ref: v1.0.0                          # pin to stable version
+    file: 'pipeline.yml'
+
+# ── Pipeline Trigger — Manual only ───────────────────────────────────────────
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'       # Manual trigger from GitLab UI
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'  # Scheduled runs (optional future)
+    - when: never                              # Never run on push/commit
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALL INPUTS — Edit these for each project / test run
+# ══════════════════════════════════════════════════════════════════════════════
+variables:
+
+  # ── Test Identification ───────────────────────────────────────────────────
+  TEST_NAME:            "DummyTestValidation"
+
+  # ── JMeter Script ─────────────────────────────────────────────────────────
+  JMX_FILE:             "scripts/PetStoreHar.jmx"
+
+  # ── JMeter Result Paths (must match listener config in JMX) ──────────────
+  AGGREGATE_REPORT:     "results/aggregate_report.csv"
+  ERROR_LOG:            "results/errors.csv"
+
+  # ── SLA Config ────────────────────────────────────────────────────────────
+  SLA_FILE:             "config/sla.json"
+
+  # ── Report Mode ───────────────────────────────────────────────────────────
+  REPORT_MODE:          "sla"             # sla | baseline
+
+  # ── Pipeline Behaviour ────────────────────────────────────────────────────
+  FAIL_PIPELINE_ON_FAIL: "true"          # true = block merge on FAIL result
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  GRAFANA_URL:          ""
+
+  # ── Artifact Retention ────────────────────────────────────────────────────
+  ARTIFACT_EXPIRE:      "30 days"
+
+  # ── Mail Config ───────────────────────────────────────────────────────────
+  MAIL_TO:              "kkhaja7289@gmail.com"
+  MAIL_CC:              ""
+  MAIL_SUBJECT_PREFIX:  "LFG Perf Report"
+  SEND_MAIL_ON:         "always"         # always | fail_only | pass_only
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECRETS — Set in GitLab → Settings → CI/CD → Variables (Protected + Masked)
+# Never put these in this file:
+#   ANTHROPIC_API_KEY
+#   SMTP_HOST
+#   SMTP_PORT
+#   SMTP_USER
+#   SMTP_PASSWORD
+#   SMTP_SSL
+# ══════════════════════════════════════════════════════════════════════════════

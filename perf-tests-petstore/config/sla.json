@@ -1,0 +1,22 @@
+{
+  "project": "PetStore",
+  "sla_unit": "ms",
+  "transactions": [
+    { "name": "PetStore_T01_Launch",               "response_time_target": 1000, "tph_target": 30  },
+    { "name": "PetStore_T02_ClickOnSignIn",         "response_time_target": 1000, "tph_target": 10  },
+    { "name": "PetStore_T02a_ClickOnRegister",      "response_time_target": 1000, "tph_target": 10  },
+    { "name": "PetStore_T02b_EnterUserDetails",     "response_time_target": 1000, "tph_target": 20  },
+    { "name": "PetStore_T02c_ClickOnCreateNewUser", "response_time_target": 1000, "tph_target": 20  },
+    { "name": "PetStore_T03_Login",                 "response_time_target": 1000, "tph_target": 20  },
+    { "name": "PetStore_T04_SelectPet",             "response_time_target": 1000, "tph_target": 20  },
+    { "name": "PetStore_T06_SelectPetSubType",      "response_time_target": 1000, "tph_target": 20  },
+    { "name": "PetStore_T07_AddToCard",             "response_time_target": 1000, "tph_target": 100 },
+    { "name": "PetStore_T08_IncreaseTheQuantity",   "response_time_target": 1000, "tph_target": 35  },
+    { "name": "PetStore_T09_ClickOnCheckOut",       "response_time_target": 1000, "tph_target": 45  },
+    { "name": "PetStore_T10_SubmitPaymentDetails",  "response_time_target": 1000, "tph_target": 10  },
+    { "name": "PetStore_T11_ProceedToOrder",        "response_time_target": 1000, "tph_target": 10  },
+    { "name": "PetStore_T12_ConformOrder",          "response_time_target": 1000, "tph_target": 10  },
+    { "name": "PetStore_T13_deleteOrderProduct",    "response_time_target": 1000, "tph_target": 5   },
+    { "name": "PetStore_T14_LogOut",                "response_time_target": 1000, "tph_target": 20  }
+  ]
+}
