@@ -13,15 +13,49 @@ stages:
 default:
   image: ubuntu:22.04
   before_script:
-    - apt-get update -qq && apt-get install -y -qq python3 python3-pip openjdk-17-jre-headless wget unzip > /dev/null
+    - export RESULTS_DIR="${RESULTS_DIR:-artifacts/results}"
+    - export REPORTS_DIR="${REPORTS_DIR:-artifacts/reports}"
+    - export FRAMEWORK_DIR="${FRAMEWORK_DIR:-perf-framework}"
+    - mkdir -p "$RESULTS_DIR" "$REPORTS_DIR"
+    - |
+      if [ ! -f "$FRAMEWORK_DIR/generate_dashboard.py" ] || [ ! -f "$FRAMEWORK_DIR/claude_insights.py" ] || [ ! -f "$FRAMEWORK_DIR/send_report.py" ]; then
+        echo "[pipeline] Shared framework scripts not found at $FRAMEWORK_DIR"
+        if [ -n "${FRAMEWORK_PROJECT_PATH:-}" ]; then
+          echo "[pipeline] Cloning shared framework from ${FRAMEWORK_PROJECT_PATH}"
+          git clone --depth=1 --branch "${FRAMEWORK_REF:-main}" "https://gitlab.com/${FRAMEWORK_PROJECT_PATH}.git" "$FRAMEWORK_DIR" >/dev/null 2>&1 || true
+        fi
+      fi
+    - apt-get update -qq && apt-get install -y -qq python3 python3-pip openjdk-17-jre-headless wget unzip curl git > /dev/null
     - pip3 install pandas --break-system-packages -q
     - |
-      if [ ! -d "$JMETER_HOME" ]; then
-        echo "Installing JMeter..."
+      export JMETER_HOME="${JMETER_HOME:-$(pwd)/apache-jmeter-5.6.3}"
+      export PATH="$JMETER_HOME/bin:$PATH"
+      if [ ! -x "$JMETER_HOME/bin/jmeter" ]; then
+        echo "[pipeline] Installing JMeter..."
         wget -q https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.tgz
         tar -xzf apache-jmeter-5.6.3.tgz
-        export JMETER_HOME=$(pwd)/apache-jmeter-5.6.3
-        export PATH=$JMETER_HOME/bin:$PATH
+        rm -f apache-jmeter-5.6.3.tgz
+        export JMETER_HOME="$(pwd)/apache-jmeter-5.6.3"
+        export PATH="$JMETER_HOME/bin:$PATH"
+      fi
+    - |
+      echo "[pipeline] Preparing JMeter dependencies..."
+      mkdir -p "$JMETER_HOME/lib/ext"
+      if [ "${INSTALL_JMETER_PLUGINS:-true}" = "true" ]; then
+        echo "[pipeline] Optional JMeter plugin setup enabled"
+        curl -fsSL https://jmeter-plugins.org/get/ -o /tmp/jmeter-plugins-manager.jar >/dev/null 2>&1 || true
+        if [ -f /tmp/jmeter-plugins-manager.jar ]; then
+          cp /tmp/jmeter-plugins-manager.jar "$JMETER_HOME/lib/ext/"
+        fi
+      fi
+      if [ -n "${BACKEND_LISTENER_JAR_URL:-}" ]; then
+        echo "[pipeline] Downloading backend listener jar from provided URL"
+        curl -fsSL "$BACKEND_LISTENER_JAR_URL" -o "$JMETER_HOME/lib/ext/backend-listener.jar" >/dev/null 2>&1 || true
+      fi
+    - |
+      if [ "${INSTALL_MONITORING_TOOLS:-false}" = "true" ]; then
+        echo "[pipeline] Installing optional monitoring tools (InfluxDB/Grafana)..."
+        apt-get install -y -qq influxdb grafana >/dev/null 2>&1 || true
       fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -31,21 +65,33 @@ default:
 run-test:
   stage: test
   script:
-    - mkdir -p results
+    - export RESULTS_DIR="${RESULTS_DIR:-artifacts/results}"
+    - export REPORTS_DIR="${REPORTS_DIR:-artifacts/reports}"
+    - mkdir -p "$RESULTS_DIR" "$REPORTS_DIR"
     - echo "[pipeline] Running JMeter test → $JMX_FILE"
     - |
-      $JMETER_HOME/bin/jmeter -n \
-        -t $JMX_FILE \
-        -l results/raw.jtl \
+      "$JMETER_HOME/bin/jmeter" -n \
+        -t "$JMX_FILE" \
+        -JURL="$TEST_URL" \
+        -JThinkTime="$THINK_TIME" \
+        -Jpacetime="$PACE_TIME" \
+        -JUsers="$USERS" \
+        -JRampup="$RAMPUP" \
+        -JTestDuration="$TEST_DURATION" \
+        -JRESULTS_DIR="$RESULTS_DIR" \
+        -JAGGREGATE_REPORT="$AGGREGATE_REPORT" \
+        -JERROR_LOG="$ERROR_LOG" \
         -Jjmeter.save.saveservice.output_format=csv \
         -Jjmeter.save.saveservice.print_field_names=true \
-        -e -o results/html_report \
+        -l "$RESULTS_DIR/raw.jtl" \
+        -e -o "$RESULTS_DIR/html_report" \
         2>&1 | tail -20
     - echo "[pipeline] JMeter test complete"
-    - ls -lh results/
+    - ls -lh "$RESULTS_DIR"
   artifacts:
     paths:
-      - results/
+      - artifacts/results/
+      - artifacts/reports/
     expire_in: 1 day           # temp — only needed between stages
   rules:
     - when: always
@@ -57,28 +103,31 @@ run-test:
 generate-report:
   stage: report
   needs: [run-test]
+  dependencies: [run-test]
   script:
-    - mkdir -p reports
+    - export RESULTS_DIR="${RESULTS_DIR:-artifacts/results}"
+    - export REPORTS_DIR="${REPORTS_DIR:-artifacts/reports}"
+    - mkdir -p "$REPORTS_DIR"
     - echo "[pipeline] Generating dashboard..."
     - |
-      AGGREGATE_REPORT=$AGGREGATE_REPORT \
-      ERROR_LOG=$ERROR_LOG \
-      SLA_FILE=$SLA_FILE \
+      AGGREGATE_REPORT="$AGGREGATE_REPORT" \
+      ERROR_LOG="$ERROR_LOG" \
+      SLA_FILE="$SLA_FILE" \
       TEST_NAME="$TEST_NAME" \
-      REPORT_MODE=$REPORT_MODE \
+      REPORT_MODE="$REPORT_MODE" \
       GRAFANA_URL="$GRAFANA_URL" \
-      OUTPUT_DIR=reports \
-      python3 .perf-framework/generate_dashboard.py
+      OUTPUT_DIR="$REPORTS_DIR" \
+      python3 "$FRAMEWORK_DIR/generate_dashboard.py"
     - echo "[pipeline] Injecting AI insights..."
     - |
-      ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-      OUTPUT_DIR=reports \
+      ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+      OUTPUT_DIR="$REPORTS_DIR" \
       TEST_NAME="$TEST_NAME" \
-      python3 .perf-framework/claude_insights.py
-    - echo "[pipeline] Dashboard ready → reports/dashboard.html"
+      python3 "$FRAMEWORK_DIR/claude_insights.py"
+    - echo "[pipeline] Dashboard ready → $REPORTS_DIR/dashboard.html"
     # Exit non-zero if FAIL result — blocks merge/deploy
     - |
-      RESULT=$(python3 -c "import json; d=json.load(open('reports/summary.json')); print(d['overall_result'])")
+      RESULT=$(python3 -c "import json; d=json.load(open('$REPORTS_DIR/summary.json')); print(d['overall_result'])")
       echo "[pipeline] Overall Result: $RESULT"
       if [ "$RESULT" = "FAIL" ] && [ "$FAIL_PIPELINE_ON_FAIL" = "true" ]; then
         echo "[pipeline] ❌ Performance gate FAILED — blocking pipeline"
@@ -87,10 +136,8 @@ generate-report:
   artifacts:
     name: "perf-report-${CI_PIPELINE_ID}"
     paths:
-      - reports/dashboard.html
-      - reports/summary.json
-      - $AGGREGATE_REPORT
-      - $ERROR_LOG
+      - artifacts/reports/
+      - artifacts/results/
     expose_as: "Performance Dashboard"
     expire_in: $ARTIFACT_EXPIRE
   rules:
@@ -103,21 +150,23 @@ generate-report:
 send-email:
   stage: notify
   needs: [generate-report]
+  dependencies: [generate-report]
   script:
+    - export REPORTS_DIR="${REPORTS_DIR:-artifacts/reports}"
     - echo "[pipeline] Sending report email..."
     - |
       MAIL_TO="$MAIL_TO" \
       MAIL_CC="$MAIL_CC" \
       MAIL_SUBJECT_PREFIX="$MAIL_SUBJECT_PREFIX" \
-      SEND_MAIL_ON=$SEND_MAIL_ON \
+      SEND_MAIL_ON="$SEND_MAIL_ON" \
       TEST_NAME="$TEST_NAME" \
-      SMTP_HOST=$SMTP_HOST \
-      SMTP_PORT=$SMTP_PORT \
-      SMTP_USER=$SMTP_USER \
-      SMTP_PASSWORD=$SMTP_PASSWORD \
-      SMTP_SSL=$SMTP_SSL \
-      OUTPUT_DIR=reports \
-      python3 .perf-framework/send_report.py
+      SMTP_HOST="$SMTP_HOST" \
+      SMTP_PORT="$SMTP_PORT" \
+      SMTP_USER="$SMTP_USER" \
+      SMTP_PASSWORD="$SMTP_PASSWORD" \
+      SMTP_SSL="$SMTP_SSL" \
+      OUTPUT_DIR="$REPORTS_DIR" \
+      python3 "$FRAMEWORK_DIR/send_report.py"
   rules:
     - when: always          # always attempt notify — send_report.py handles conditions
   allow_failure: true       # mail failure never breaks pipeline

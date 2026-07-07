@@ -9,6 +9,10 @@ include:
     ref: v1.0.0                          # pin to stable version
     file: 'pipeline.yml'
 
+variables:
+  FRAMEWORK_PROJECT_PATH: "your-group/perf-framework"
+  FRAMEWORK_REF:          "v1.0.0"
+
 # ── Pipeline Trigger — Manual only ───────────────────────────────────────────
 workflow:
   rules:
@@ -27,9 +31,20 @@ variables:
   # ── JMeter Script ─────────────────────────────────────────────────────────
   JMX_FILE:             "scripts/PetStoreHar.jmx"
 
+  # ── JMeter Runtime Parameters ────────────────────────────────────────────
+  TEST_URL:             "jpetstore.aspectran.com"
+  THINK_TIME:           "3000"
+  PACE_TIME:            "60000"
+  USERS:                "10"
+  RAMPUP:               "300"
+  TEST_DURATION:        "600"
+
   # ── JMeter Result Paths (must match listener config in JMX) ──────────────
-  AGGREGATE_REPORT:     "results/aggregate_report.csv"
-  ERROR_LOG:            "results/errors.csv"
+  RESULTS_DIR:          "artifacts/results"
+  REPORTS_DIR:          "artifacts/reports"
+  AGGREGATE_REPORT:     "artifacts/results/aggregate_report.csv"
+  ERROR_LOG:            "artifacts/results/errors.csv"
+  OUTPUT_DIR:           "artifacts/reports"
 
   # ── SLA Config ────────────────────────────────────────────────────────────
   SLA_FILE:             "config/sla.json"
@@ -42,6 +57,9 @@ variables:
 
   # ── Grafana ───────────────────────────────────────────────────────────────
   GRAFANA_URL:          ""
+  INSTALL_MONITORING_TOOLS: "false"
+  BACKEND_LISTENER_JAR_URL: ""
+  INSTALL_JMETER_PLUGINS: "true"
 
   # ── Artifact Retention ────────────────────────────────────────────────────
   ARTIFACT_EXPIRE:      "30 days"
