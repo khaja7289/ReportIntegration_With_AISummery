@@ -1,562 +1,777 @@
 """
-generate_dashboard.py — PetStore Performance Framework
-Reads: JMeter aggregate CSV + errors CSV + SLA JSON
-Output: dashboard.html + summary.json
+generate_dashboard.py — Performance Testing Framework
+Reads: JMeter Simple Data Writer (sdw.csv / raw results) + SLA JSON
+Outputs:
+  - 01_all_transactions.csv
+  - 02_tph_not_achieved.csv (Amber/Red only)
+  - 03_sla_90pct_deviation.csv (Amber/Red only)
+  - 04_error_transactions.csv
+  - summary.json
+  - dashboard.html
 """
 
-import os, json, csv
+import os
+import json
+import re
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
-AGGREGATE_REPORT = os.environ.get("AGGREGATE_REPORT", "results/aggregate_report.csv")
-ERROR_LOG        = os.environ.get("ERROR_LOG",        "results/errors.csv")
-SLA_FILE         = os.environ.get("SLA_FILE",         "config/sla.json")
+# ── Environment & Paths ───────────────────────────────────────────────────────
+RESULTS_DIR      = os.environ.get("RESULTS_DIR",      "artifacts/results")
+OUTPUT_DIR       = os.environ.get("OUTPUT_DIR",       "artifacts/reports")
+SDW_REPORT       = os.environ.get("SDW_REPORT",       "")
+AGGREGATE_REPORT = os.environ.get("AGGREGATE_REPORT", "")
+SLA_FILE         = os.environ.get("SLA_FILE",         "perf-tests-petstore/config/sla.json")
 TEST_NAME        = os.environ.get("TEST_NAME",        "Performance Test")
-REPORT_MODE      = os.environ.get("REPORT_MODE",      "sla")
 GRAFANA_URL      = os.environ.get("GRAFANA_URL",      "")
-OUTPUT_DIR       = os.environ.get("OUTPUT_DIR",       "reports")
+
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-# ── Thresholds ────────────────────────────────────────────────────────────────
-RT_AMBER = 110; RT_RED = 120
-TPH_OVER = 110; TPH_GREEN_MIN = 90; TPH_AMBER_MIN = 80
+# ── Locate Input Data ─────────────────────────────────────────────────────────
+def find_input_file():
+    candidates = [
+        SDW_REPORT,
+        AGGREGATE_REPORT,
+        f"{RESULTS_DIR}/sdw.csv",
+        f"{RESULTS_DIR}/aggregate_report.csv",
+        f"{RESULTS_DIR}/raw.jtl",
+        "artifacts/results/sdw.csv",
+        "artifacts/results/aggregate_report.csv",
+        "sdw.csv",
+        "aggregate_report.csv"
+    ]
+    for c in candidates:
+        if c and Path(c).exists() and Path(c).is_file():
+            return str(c)
+    return candidates[0] if candidates[0] else f"{RESULTS_DIR}/sdw.csv"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PARSE
-# ══════════════════════════════════════════════════════════════════════════════
-def parse_aggregate(path):
-    df = pd.read_csv(path)
-    df.columns = df.columns.str.strip()
-    rename = {
-        "Label":"transaction","# Samples":"samples","Average":"avg_rt",
-        "Median":"p50_rt","90% Line":"p90_rt","95% Line":"p95_rt",
-        "99% Line":"p99_rt","Min":"min_rt","Max":"max_rt",
-        "Error%":"error_pct","Throughput":"tps","Received KB/sec":"rcv_kb","Sent KB/sec":"snt_kb"
-    }
-    df.rename(columns={k:v for k,v in rename.items() if k in df.columns}, inplace=True)
-    df["error_pct"] = df["error_pct"].astype(str).str.replace("%","").astype(float)
-    df["tph"]       = df["tps"] * 3600
-    df["p80_rt"]    = ((df["p50_rt"] + df["p90_rt"]) / 2).round(1)
-    df["error_count"] = (df["samples"] * df["error_pct"] / 100).round(0).astype(int)
-    df = df[~df["transaction"].str.upper().str.contains("TOTAL", na=False)]
-    return df.reset_index(drop=True)
 
-def parse_errors(path):
+def percentile(series, p):
+    return series.quantile(p / 100)
+
+
+# ── Load SLA ──────────────────────────────────────────────────────────────────
+def load_sla(path):
     if not Path(path).exists():
-        return pd.DataFrame()
-    df = pd.read_csv(path)
-    df.columns = df.columns.str.strip()
-    rename = {"label":"transaction","responseCode":"response_code",
-              "responseMessage":"response_message","failureMessage":"failure_message","elapsed":"elapsed"}
-    df.rename(columns={k:v for k,v in rename.items() if k in df.columns}, inplace=True)
-    for c in ["transaction","response_code","response_message","failure_message"]:
-        if c not in df.columns: df[c] = ""
-    grp = (df.groupby(["transaction","response_code","response_message","failure_message"])
-             .size().reset_index(name="count").sort_values("count", ascending=False))
-    return grp
+        # Fallback check
+        alt = Path("config/sla.json")
+        if alt.exists():
+            path = str(alt)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {
+        t["name"]: {
+            "resp": t["response_time_target"],
+            "tph": t["tph_target"]
+        }
+        for t in data.get("transactions", [])
+    }
 
-def parse_sla(path):
-    with open(path) as f: data = json.load(f)
-    return {t["name"]:{"rt_target":t["response_time_target"],"tph_target":t["tph_target"]}
-            for t in data.get("transactions",[])}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STATUS LOGIC
-# ══════════════════════════════════════════════════════════════════════════════
-def rt_status(p90, target):
-    if target <= 0: return "N/A", 100.0
-    pct = (p90 / target) * 100
-    ach = round((target / p90) * 100, 1) if p90 > 0 else 100.0
-    if pct <= RT_AMBER:   return "GREEN", ach
-    elif pct <= RT_RED:   return "AMBER", ach
-    else:                 return "RED",   ach
+# ── Process Raw Data & Generate 4 Structured CSVs ──────────────────────────────
+def process_data(input_csv, sla_map, out_dir):
+    print(f"[generate_dashboard] Loading raw results from: {input_csv}")
+    agg = pd.read_csv(input_csv)
+    agg.columns = agg.columns.str.strip()
 
-def tph_status(tph, target):
-    if target <= 0: return "N/A", 100.0, "N/A"
-    pct = round((tph / target) * 100, 1)
-    if pct > TPH_OVER:        return "GREEN", pct, "Over Achieved"
-    elif pct >= TPH_GREEN_MIN: return "GREEN", pct, "Achieved"
-    elif pct >= TPH_AMBER_MIN: return "AMBER", pct, "Partially Achieved"
-    else:                      return "RED",   pct, "Not Achieved"
+    # Normalize column names if needed
+    rename_cols = {
+        "Label": "label",
+        "Elapsed": "elapsed",
+        "Success": "success",
+        "Timestamp": "timeStamp",
+        "ResponseCode": "responseCode",
+        "response_code": "responseCode"
+    }
+    agg.rename(columns={k: v for k, v in rename_cols.items() if k in agg.columns}, inplace=True)
 
-def overall_status(rt_s, tph_s):
-    s = {rt_s, tph_s}
-    if "RED" in s:   return "RED"
-    if "AMBER" in s: return "AMBER"
-    return "GREEN"
+    # Ensure required columns
+    if "elapsed" not in agg.columns:
+        # If input came from an aggregate report rather than raw samples
+        if "Average" in agg.columns:
+            agg["elapsed"] = pd.to_numeric(agg["Average"], errors="coerce")
+        else:
+            raise ValueError("Input CSV missing 'elapsed' column required for percentile analysis.")
+    else:
+        agg["elapsed"] = pd.to_numeric(agg["elapsed"], errors="coerce")
 
-def error_impact(err_pct):
-    if err_pct >= 5: return "HIGH"
-    if err_pct >= 1: return "MEDIUM"
-    return "LOW"
+    if "success" not in agg.columns:
+        agg["success"] = True
+    else:
+        agg["success"] = agg["success"].astype(str).str.strip().str.lower().isin(["true", "1"])
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BUILD TRANSACTIONS
-# ══════════════════════════════════════════════════════════════════════════════
-def build_transactions(agg_df, sla):
-    rows = []
-    for _, r in agg_df.iterrows():
-        name = r["transaction"]
-        tgt  = sla.get(name, {"rt_target":0,"tph_target":0})
-        p90  = round(float(r.get("p90_rt",0)),1)
-        tph  = round(float(r.get("tph",0)),1)
-        err  = round(float(r.get("error_pct",0)),2)
-        rt_s, rt_ach   = rt_status(p90, tgt["rt_target"])
-        tph_s, tph_ach, tph_lbl = tph_status(tph, tgt["tph_target"])
-        rows.append({
+    if "label" not in agg.columns and "transaction" in agg.columns:
+        agg["label"] = agg["transaction"]
+    agg["label"] = agg["label"].astype(str).str.strip()
+
+    if "timeStamp" not in agg.columns:
+        agg["timeStamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if "responseCode" not in agg.columns:
+        agg["responseCode"] = "200"
+
+    # Base summary grouped by label
+    summary = agg.groupby("label").agg(
+        hitcount=("elapsed", "count"),
+        avg=("elapsed", "mean"),
+        min=("elapsed", "min"),
+        max=("elapsed", "max"),
+        p80=("elapsed", lambda x: percentile(x, 80)),
+        p90=("elapsed", lambda x: percentile(x, 90)),
+        errors=("success", lambda x: (x == False).sum())
+    ).reset_index()
+
+    summary["error_pct"] = (summary["errors"] / summary["hitcount"]) * 100
+    summary = summary.rename(columns={"label": "Transaction", "p80": "80%", "p90": "90%"})
+    summary = summary[summary["Transaction"].isin(sla_map.keys())].copy()
+
+    # Round numerical metrics
+    summary["90%"] = summary["90%"].round(1)
+    summary["80%"] = summary["80%"].round(1)
+    summary["avg"] = summary["avg"].round(1)
+    summary["min"] = summary["min"].round(1)
+    summary["max"] = summary["max"].round(1)
+    summary["hitcount"] = summary["hitcount"].astype(int)
+    summary["errors"] = summary["errors"].astype(int)
+    summary["error_pct"] = summary["error_pct"].round(2)
+
+    # 1. All Transactions
+    all_tx = summary[["Transaction", "90%", "80%", "avg", "min", "max", "hitcount", "errors", "error_pct"]].copy()
+    all_tx_path = f"{out_dir}/01_all_transactions.csv"
+    all_tx.to_csv(all_tx_path, index=False)
+    print(f"[generate_dashboard] Wrote: {all_tx_path}")
+
+    # 2. TPH not achieved -> only amber/red
+    tph = []
+    for _, row in summary.iterrows():
+        target_tph = sla_map[row["Transaction"]]["tph"]
+        if target_tph:
+            achievement = (row["hitcount"] / target_tph) * 100
+            if 80 <= achievement <= 89:   # amber
+                tph.append([row["Transaction"], row["90%"], row["hitcount"], round(achievement, 2), target_tph, "AMBER"])
+            elif achievement < 80:        # red
+                tph.append([row["Transaction"], row["90%"], row["hitcount"], round(achievement, 2), target_tph, "RED"])
+
+    tph_df = pd.DataFrame(
+        [[r[0], r[1], r[2], r[3]] for r in tph],
+        columns=["Transaction", "90%", "hitcount", "TPH%_achieved"]
+    )
+    tph_path = f"{out_dir}/02_tph_not_achieved.csv"
+    tph_df.to_csv(tph_path, index=False)
+    print(f"[generate_dashboard] Wrote: {tph_path} ({len(tph)} exceptions)")
+
+    # 3. SLA 90% deviation -> percentage deviation from SLA (amber/red only)
+    sla_dev = []
+    for _, row in summary.iterrows():
+        target_resp = sla_map[row["Transaction"]]["resp"]
+        if target_resp:
+            ratio = (row["90%"] / target_resp) * 100
+            deviation_pct = ratio - 100   # deviation in %
+            if 111 <= ratio <= 120:   # amber
+                sla_dev.append([row["Transaction"], row["90%"], row["80%"], row["avg"], round(deviation_pct, 2), target_resp, "AMBER"])
+            elif ratio > 120:         # red
+                sla_dev.append([row["Transaction"], row["90%"], row["80%"], row["avg"], round(deviation_pct, 2), target_resp, "RED"])
+
+    sla_dev_df = pd.DataFrame(
+        [[r[0], r[1], r[2], r[3], r[4]] for r in sla_dev],
+        columns=["Transaction", "90%", "80%", "avg", "Deviation_from_SLA"]
+    )
+    sla_dev_path = f"{out_dir}/03_sla_90pct_deviation.csv"
+    sla_dev_df.to_csv(sla_dev_path, index=False)
+    print(f"[generate_dashboard] Wrote: {sla_dev_path} ({len(sla_dev)} exceptions)")
+
+    # 4. Error transactions -> simplified format
+    failures = agg[agg["success"] == False].copy()
+    if not failures.empty:
+        failures["fail_count"] = 1
+        failures_summary = failures.groupby(
+            ["timeStamp", "label", "responseCode"]
+        ).agg(fail_count=("fail_count", "sum")).reset_index()
+
+        txn_counts = agg.groupby("label")["success"].count()
+        failures_summary["fail%"] = failures_summary.apply(
+            lambda r: round((r["fail_count"] / txn_counts.get(r["label"], 1)) * 100, 2), axis=1
+        )
+        failures_summary = failures_summary.rename(columns={"label": "Transaction", "responseCode": "ResponseCode"})
+    else:
+        failures_summary = pd.DataFrame(columns=["timeStamp", "Transaction", "ResponseCode", "fail_count", "fail%"])
+
+    err_path = f"{out_dir}/04_error_transactions.csv"
+    failures_summary.to_csv(err_path, index=False)
+    print(f"[generate_dashboard] Wrote: {err_path} ({len(failures_summary)} error groups)")
+
+    return summary, tph, sla_dev, failures_summary
+
+
+# ── Status and Scoring Engine ─────────────────────────────────────────────────
+def evaluate_performance(summary, tph, sla_dev, sla_map):
+    tx_detail = []
+    red_count = 0
+    amber_count = 0
+    green_count = 0
+
+    tph_exc_map = {r[0]: r[5] for r in tph}
+    sla_dev_map = {r[0]: (r[4], r[6]) for r in sla_dev}
+
+    for _, row in summary.iterrows():
+        name = row["Transaction"]
+        target_resp = sla_map.get(name, {}).get("resp", 0)
+        target_tph = sla_map.get(name, {}).get("tph", 0)
+        p90 = row["90%"]
+        p80 = row["80%"]
+        avg = row["avg"]
+        hitcount = row["hitcount"]
+        errors = row["errors"]
+        err_pct = row["error_pct"]
+
+        # RT status
+        if name in sla_dev_map:
+            rt_dev, rt_st = sla_dev_map[name]
+        else:
+            rt_st = "GREEN"
+            rt_dev = round(((p90 / target_resp) * 100 - 100), 2) if target_resp > 0 else 0.0
+
+        # TPH status
+        if name in tph_exc_map:
+            tph_st = tph_exc_map[name]
+            ach = round((hitcount / target_tph) * 100, 2) if target_tph > 0 else 100.0
+        else:
+            tph_st = "GREEN"
+            ach = round((hitcount / target_tph) * 100, 2) if target_tph > 0 else 100.0
+
+        # Overall transaction status
+        if "RED" in (rt_st, tph_st):
+            overall_st = "RED"
+            red_count += 1
+        elif "AMBER" in (rt_st, tph_st):
+            overall_st = "AMBER"
+            amber_count += 1
+        else:
+            overall_st = "GREEN"
+            green_count += 1
+
+        tx_detail.append({
             "name": name,
-            "samples":     int(r.get("samples",0)),
-            "error_count": int(r.get("error_count",0)),
-            "error_pct":   err,
-            "avg_rt":      round(float(r.get("avg_rt",0)),1),
-            "p80_rt":      round(float(r.get("p80_rt",0)),1),
-            "p90_rt":      p90,
-            "p95_rt":      round(float(r.get("p95_rt",0)),1),
-            "max_rt":      round(float(r.get("max_rt",0)),1),
-            "tph":         round(tph,1),
-            "rt_target":   tgt["rt_target"],
-            "tph_target":  tgt["tph_target"],
-            "rt_status":   rt_s, "tph_status": tph_s,
-            "tph_label":   tph_lbl, "overall_status": overall_status(rt_s, tph_s),
-            "rt_ach_pct":  rt_ach, "tph_ach_pct": tph_ach,
-            "impact":      error_impact(err),
+            "p90": p90,
+            "p80": p80,
+            "avg": avg,
+            "min": row["min"],
+            "max": row["max"],
+            "hitcount": hitcount,
+            "errors": errors,
+            "error_pct": err_pct,
+            "rt_target": target_resp,
+            "tph_target": target_tph,
+            "rt_status": rt_st,
+            "tph_status": tph_st,
+            "overall_status": overall_st,
+            "rt_deviation_pct": rt_dev,
+            "tph_ach_pct": ach
         })
-    order = {"RED":0,"AMBER":1,"GREEN":2,"N/A":3}
-    rows.sort(key=lambda x: order.get(x["overall_status"],4))
-    return rows
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SCORES
-# ══════════════════════════════════════════════════════════════════════════════
-def perf_score(trx):
-    if not trx: return 0,"D","Failed"
-    n = len(trx)
-    wt = {"GREEN":1.0,"AMBER":0.5,"RED":0.0,"N/A":1.0}
-    rt  = sum(wt.get(t["rt_status"],0) for t in trx)/n*50
-    tp  = sum(wt.get(t["tph_status"],0) for t in trx)/n*30
-    er  = max(0,(1-sum(t["error_pct"] for t in trx)/n/100))*20
-    s   = round(max(0,min(100, rt+tp+er)),1)
-    if s>=90: return s,"A+","Excellent"
-    if s>=80: return s,"A","Good"
-    if s>=70: return s,"B","Acceptable"
-    if s>=60: return s,"C","Needs Attention"
-    return s,"D","Failed"
+    # Overall test result
+    if red_count > 0:
+        res = "FAIL"
+    elif amber_count > 0:
+        res = "PARTIAL PASS"
+    else:
+        res = "PASS"
 
-def stab_score(trx):
-    if not trx: return 0,"Unstable"
-    e,sp,g = [],[],[]
-    for t in trx:
-        e.append(max(0,100-t["error_pct"]*5))
-        sp.append(max(0,100-((t["p90_rt"]-t["p80_rt"])/t["p80_rt"]*100*2)) if t["p80_rt"]>0 else 100)
-        g.append(max(0,100-((t["max_rt"]-t["avg_rt"])/t["avg_rt"]*100)) if t["avg_rt"]>0 else 100)
-    s = round(max(0,min(100,(sum(e)/len(e)+sum(sp)/len(sp)+sum(g)/len(g))/3)),1)
-    if s>=90: return s,"Highly Stable"
-    if s>=80: return s,"Stable"
-    if s>=70: return s,"Moderately Stable"
-    return s,"Unstable"
+    # Performance Score
+    n = len(tx_detail)
+    if n > 0:
+        wt = {"GREEN": 1.0, "AMBER": 0.5, "RED": 0.0}
+        rt_pts = sum(wt.get(t["rt_status"], 0) for t in tx_detail) / n * 50
+        tp_pts = sum(wt.get(t["tph_status"], 0) for t in tx_detail) / n * 30
+        er_pts = max(0, (1 - sum(t["error_pct"] for t in tx_detail) / n / 100)) * 20
+        ps = round(max(0, min(100, rt_pts + tp_pts + er_pts)), 1)
+    else:
+        ps = 0.0
 
-def overall_result(trx):
-    st = [t["overall_status"] for t in trx]
-    if "RED" in st:   return "FAIL"
-    if "AMBER" in st: return "PARTIAL PASS"
-    return "PASS"
+    if ps >= 90:
+        pg, pst = "A+", "Excellent"
+    elif ps >= 80:
+        pg, pst = "A", "Good"
+    elif ps >= 70:
+        pg, pst = "B", "Acceptable"
+    elif ps >= 60:
+        pg, pst = "C", "Needs Attention"
+    else:
+        pg, pst = "D", "Failed"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HTML HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+    # Stability Score
+    if n > 0:
+        e, sp, g = [], [], []
+        for t in tx_detail:
+            e.append(max(0, 100 - t["error_pct"] * 5))
+            sp.append(max(0, 100 - ((t["p90"] - t["p80"]) / t["p80"] * 100 * 2)) if t["p80"] > 0 else 100)
+            g.append(max(0, 100 - ((t["max"] - t["avg"]) / t["avg"] * 100)) if t["avg"] > 0 else 100)
+        ss = round(max(0, min(100, (sum(e) / len(e) + sum(sp) / len(sp) + sum(g) / len(g)) / 3)), 1)
+    else:
+        ss = 0.0
+
+    if ss >= 90:
+        sst = "Highly Stable"
+    elif ss >= 80:
+        sst = "Stable"
+    elif ss >= 70:
+        sst = "Moderately Stable"
+    else:
+        sst = "Unstable"
+
+    return tx_detail, res, ps, pg, pst, ss, sst, green_count, amber_count, red_count
+
+
+# ── HTML Dashboard Builder ────────────────────────────────────────────────────
 STATUS_COLORS = {
-    "GREEN":"#22c55e","AMBER":"#f59e0b","RED":"#ef4444","N/A":"#64748b",
-    "PASS":"#22c55e","PARTIAL PASS":"#f59e0b","FAIL":"#ef4444",
-    "HIGH":"#ef4444","MEDIUM":"#f59e0b","LOW":"#22c55e",
-    "Over Achieved":"#16a34a","Achieved":"#22c55e",
-    "Partially Achieved":"#f59e0b","Not Achieved":"#ef4444",
+    "GREEN": "#22c55e",
+    "AMBER": "#f59e0b",
+    "RED": "#ef4444",
+    "PASS": "#22c55e",
+    "PARTIAL PASS": "#f59e0b",
+    "FAIL": "#ef4444"
 }
-def pill(label, bold=False):
-    bg = STATUS_COLORS.get(label,"#64748b")
-    fw = "700" if bold else "600"
-    return f'<span style="background:{bg};color:#fff;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:{fw};">{label}</span>'
 
-def result_badge(r):
-    icons={"PASS":"✅","PARTIAL PASS":"⚠️","FAIL":"❌"}
-    bg=STATUS_COLORS.get(r,"#64748b")
-    return f'<span style="background:{bg};color:#fff;padding:8px 22px;border-radius:20px;font-size:15px;font-weight:700;">{icons.get(r,"")} {r}</span>'
+def badge(label):
+    color = STATUS_COLORS.get(label, "#64748b")
+    return f'<span style="background:{color};color:#fff;padding:3px 9px;border-radius:12px;font-size:11px;font-weight:700;">{label}</span>'
 
-def grade_color(g):
-    return {"A+":"#22c55e","A":"#4ade80","B":"#facc15","C":"#f97316","D":"#ef4444"}.get(g,"#64748b")
+def result_badge(res):
+    color = STATUS_COLORS.get(res, "#64748b")
+    icon = {"PASS": "✅", "PARTIAL PASS": "⚠️", "FAIL": "❌"}.get(res, "")
+    return f'<span style="background:{color};color:#fff;padding:8px 20px;border-radius:20px;font-size:15px;font-weight:700;">{icon} {res}</span>'
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BUILD HTML
-# ══════════════════════════════════════════════════════════════════════════════
-def build_html(summary, trx, errors_df):
-    # Pre-compute chart data
-    passed  = summary["passed"]; partial = summary["partial"]; failed = summary["failed"]
-    rt_g = sum(1 for t in trx if t["rt_status"]=="GREEN")
-    rt_a = sum(1 for t in trx if t["rt_status"]=="AMBER")
-    rt_r = sum(1 for t in trx if t["rt_status"]=="RED")
-    tp_g = sum(1 for t in trx if t["tph_status"]=="GREEN")
-    tp_a = sum(1 for t in trx if t["tph_status"]=="AMBER")
-    tp_r = sum(1 for t in trx if t["tph_status"]=="RED")
-    top10s  = sorted(trx, key=lambda x:x["p90_rt"], reverse=True)[:10]
-    top10ta = sorted(trx, key=lambda x:x["tph_ach_pct"])[:10]
-    top5s   = sorted(trx, key=lambda x:x["p90_rt"], reverse=True)[:5]
-    top5t   = sorted(trx, key=lambda x:x["tph_ach_pct"])[:5]
-    top5e   = sorted(trx, key=lambda x:x["error_pct"], reverse=True)[:5]
-    ra_rt   = [t for t in trx if t["rt_status"]  in ("RED","AMBER")]
-    ra_tph  = [t for t in trx if t["tph_status"] in ("RED","AMBER")]
 
-    pc  = summary["perf_score"]; pg = summary["perf_grade"]; sc = summary["stab_score"]
-    res = summary["overall_result"]
-    pc_col = grade_color(pg)
-    res_col= STATUS_COLORS.get(res,"#64748b")
+def build_dashboard_html(summary_dict):
+    txs = summary_dict["all_transactions"]
+    tph_exc = summary_dict["tph_not_achieved"]
+    sla_exc = summary_dict["sla_90pct_deviation"]
+    errors = summary_dict["error_transactions"]
 
-    def js_labels(lst): return json.dumps([t["name"] for t in lst])
-    def js_vals(lst,k):  return json.dumps([t[k] for t in lst])
-
-    # ── SLA Table Rows ──────────────────────────────────────────────────────
-    sla_rows = ""
-    for t in trx:
-        sla_rows += f"""<tr>
-          <td style="font-weight:500;white-space:nowrap;">{t['name']}</td>
-          <td class="tc">{t['rt_target']} ms</td>
-          <td class="tc">{t['avg_rt']} ms</td>
-          <td class="tc">{t['p80_rt']} ms</td>
-          <td class="tc" style="font-weight:700;">{t['p90_rt']} ms</td>
-          <td class="tc">{t['p95_rt']} ms</td>
-          <td class="tc">{t['max_rt']} ms</td>
-          <td class="tc">{pill(t['rt_status'])}</td>
-          <td class="tc">{t['tph_target']}</td>
-          <td class="tc">{t['tph']}</td>
-          <td class="tc">{pill(t['tph_label'])}</td>
-          <td class="tc" style="font-weight:600;">{t['rt_ach_pct']}%</td>
-          <td class="tc" style="font-weight:600;">{t['tph_ach_pct']}%</td>
-          <td class="tc">{pill(t['overall_status'])}</td>
+    # Table 1: All Transactions
+    rows_all = ""
+    for t in txs:
+        rows_all += f"""<tr>
+            <td style="font-weight:600;white-space:nowrap;">{t['name']}</td>
+            <td class="tc" style="font-weight:700;color:#60a5fa;">{t['p90']} ms</td>
+            <td class="tc">{t['p80']} ms</td>
+            <td class="tc">{t['avg']} ms</td>
+            <td class="tc">{t['min']} ms</td>
+            <td class="tc">{t['max']} ms</td>
+            <td class="tc" style="font-weight:600;">{t['hitcount']}</td>
+            <td class="tc">{t['errors']}</td>
+            <td class="tc" style="color:{'#ef4444' if t['error_pct']>0 else '#94a3b8'};">{t['error_pct']}%</td>
+            <td class="tc">{badge(t['overall_status'])}</td>
         </tr>"""
 
-    # ── Error Table Rows ────────────────────────────────────────────────────
-    err_rows = ""
-    if not errors_df.empty:
-        for _, r in errors_df.iterrows():
-            trx_data = next((t for t in trx if t["name"]==r.get("transaction","")), None)
-            ep = trx_data["error_pct"] if trx_data else 0
-            err_rows += f"""<tr>
-              <td style="white-space:nowrap;">{r.get('transaction','')}</td>
-              <td class="tc"><code style="background:#0f172a;padding:2px 6px;border-radius:4px;color:#f87171;">{r.get('response_code','')}</code></td>
-              <td>{r.get('response_message','')}</td>
-              <td style="font-size:12px;color:#94a3b8;max-width:280px;">{r.get('failure_message','')}</td>
-              <td class="tc" style="font-weight:700;color:#f87171;">{r.get('count',0)}</td>
-              <td class="tc">{ep}%</td>
-              <td class="tc">{pill(error_impact(ep))}</td>
+    # Table 2: TPH Not Achieved
+    rows_tph = ""
+    if tph_exc:
+        for r in tph_exc:
+            rows_tph += f"""<tr>
+                <td style="font-weight:600;white-space:nowrap;">{r['name']}</td>
+                <td class="tc">{r['p90']} ms</td>
+                <td class="tc" style="font-weight:600;">{r['hitcount']}</td>
+                <td class="tc">{r['target_tph']}</td>
+                <td class="tc" style="font-weight:700;color:{'#ef4444' if r['status']=='RED' else '#f59e0b'};">{r['tph_ach_pct']}%</td>
+                <td class="tc">{badge(r['status'])}</td>
             </tr>"""
     else:
-        err_rows = '<tr><td colspan="7" class="tc" style="color:#22c55e;padding:20px;">✅ No errors recorded</td></tr>'
+        rows_tph = '<tr><td colspan="6" class="tc" style="color:#22c55e;padding:18px;">✅ All transactions met or exceeded throughput targets</td></tr>'
 
-    # ── RT Exceptions ───────────────────────────────────────────────────────
-    rt_exc = ""
-    for t in sorted(ra_rt, key=lambda x:x["rt_ach_pct"]):
-        gap = round(t["p90_rt"]-t["rt_target"],1) if t["rt_target"]>0 else 0
-        reason = "Response time exceeded SLA by >20%" if t["rt_status"]=="RED" else "Response time within warning threshold"
-        action = "Investigate DB queries and backend API latency" if t["rt_status"]=="RED" else "Monitor and optimise before next run"
-        rt_exc += f"""<tr>
-          <td style="white-space:nowrap;">{t['name']}</td>
-          <td class="tc">{t['rt_target']} ms</td>
-          <td class="tc" style="font-weight:700;">{t['p90_rt']} ms</td>
-          <td class="tc" style="color:#f87171;">+{gap} ms</td>
-          <td class="tc">{t['rt_ach_pct']}%</td>
-          <td class="tc">{pill(t['rt_status'])}</td>
-          <td style="font-size:12px;">{reason}</td>
-          <td style="font-size:12px;color:#94a3b8;">{action}</td>
-        </tr>"""
-    if not rt_exc:
-        rt_exc = '<tr><td colspan="8" class="tc" style="color:#22c55e;padding:20px;">✅ No Response Time Exceptions</td></tr>'
+    # Table 3: SLA 90% Deviation
+    rows_sla = ""
+    if sla_exc:
+        for r in sla_exc:
+            rows_sla += f"""<tr>
+                <td style="font-weight:600;white-space:nowrap;">{r['name']}</td>
+                <td class="tc" style="font-weight:700;color:{'#ef4444' if r['status']=='RED' else '#f59e0b'};">{r['p90']} ms</td>
+                <td class="tc">{r['p80']} ms</td>
+                <td class="tc">{r['avg']} ms</td>
+                <td class="tc">{r['target_resp']} ms</td>
+                <td class="tc" style="font-weight:700;color:{'#ef4444' if r['status']=='RED' else '#f59e0b'};">+{r['deviation_pct']}%</td>
+                <td class="tc">{badge(r['status'])}</td>
+            </tr>"""
+    else:
+        rows_sla = '<tr><td colspan="7" class="tc" style="color:#22c55e;padding:18px;">✅ All transactions met response time SLA thresholds (P90 within limits)</td></tr>'
 
-    # ── TPH Exceptions ──────────────────────────────────────────────────────
-    tph_exc = ""
-    for t in sorted(ra_tph, key=lambda x:x["tph_ach_pct"]):
-        gap = round(t["tph"]-t["tph_target"],1)
-        reason = "Throughput not achieved — possible bottleneck" if t["tph_status"]=="RED" else "Throughput partially achieved"
-        action = "Review thread pool, connection limits and server capacity"
-        tph_exc += f"""<tr>
-          <td style="white-space:nowrap;">{t['name']}</td>
-          <td class="tc">{t['tph_target']}</td>
-          <td class="tc" style="font-weight:700;">{t['tph']}</td>
-          <td class="tc" style="color:#f87171;">{gap}</td>
-          <td class="tc">{t['tph_ach_pct']}%</td>
-          <td class="tc">{pill(t['tph_status'])}</td>
-          <td style="font-size:12px;">{reason}</td>
-          <td style="font-size:12px;color:#94a3b8;">{action}</td>
-        </tr>"""
-    if not tph_exc:
-        tph_exc = '<tr><td colspan="8" class="tc" style="color:#22c55e;padding:20px;">✅ No Throughput Exceptions</td></tr>'
+    # Table 4: Error Transactions
+    rows_err = ""
+    if errors:
+        for r in errors:
+            rows_err += f"""<tr>
+                <td class="tc" style="color:#94a3b8;font-size:11px;">{r.get('timeStamp','')}</td>
+                <td style="font-weight:600;white-space:nowrap;">{r.get('Transaction','')}</td>
+                <td class="tc"><code style="background:#0f172a;padding:2px 6px;border-radius:4px;color:#f87171;">{r.get('ResponseCode','')}</code></td>
+                <td class="tc" style="font-weight:700;color:#f87171;">{r.get('fail_count',0)}</td>
+                <td class="tc" style="font-weight:600;color:#f87171;">{r.get('fail%',0)}%</td>
+            </tr>"""
+    else:
+        rows_err = '<tr><td colspan="5" class="tc" style="color:#22c55e;padding:18px;">✅ Zero errors recorded across all test transactions</td></tr>'
 
-    # ── Top Risk Rows ───────────────────────────────────────────────────────
-    def risk_rows(items, key, unit):
-        rows=""
-        for i,t in enumerate(items,1):
-            rows+=f'<tr><td class="tc" style="color:#f59e0b;font-weight:700;">#{i}</td><td style="font-size:12px;">{t["name"]}</td><td class="tc" style="font-weight:600;">{t[key]} {unit}</td><td class="tc">{pill(t["overall_status"])}</td></tr>'
-        return rows
+    # Chart data
+    chart_tx_labels = json.dumps([t["name"] for t in txs])
+    chart_p90_vals = json.dumps([t["p90"] for t in txs])
+    chart_tph_vals = json.dumps([t["tph_ach_pct"] for t in txs])
+    chart_err_vals = json.dumps([t["error_pct"] for t in txs])
 
-    # ── Grafana ─────────────────────────────────────────────────────────────
-    grafana_html = ""
+    grafana_block = ""
     if GRAFANA_URL:
-        grafana_html = f"""
-        <div class="card">
-          <h2 class="sec-title">📈 Grafana Dashboard</h2>
-          <p style="color:#94a3b8;margin-bottom:16px;">Real-time metrics for this test execution window.</p>
-          <a href="{GRAFANA_URL}" target="_blank" class="btn-link">🔗 Open Grafana Dashboard</a>
+        grafana_block = f"""
+        <div class="card" style="text-align:center;padding:18px;">
+          <a href="{GRAFANA_URL}" target="_blank" class="btn-link">📈 View Live Metrics in Grafana</a>
         </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>{TEST_NAME} — Performance Dashboard</title>
+<title>{TEST_NAME} — Performance Report</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
-body{{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;}}
-.hdr{{background:linear-gradient(135deg,#1e3a5f,#1e293b);padding:20px 32px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;}}
-.hdr h1{{font-size:20px;font-weight:700;color:#f1f5f9;}}
+body{{font-family:system-ui,-apple-system,sans-serif;background:#0b0f19;color:#e2e8f0;line-height:1.5;}}
+.hdr{{background:linear-gradient(135deg,#1e293b,#0f172a);padding:22px 36px;border-bottom:1px solid #1e293b;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;}}
+.hdr h1{{font-size:22px;font-weight:700;color:#f8fafc;display:flex;align-items:center;gap:10px;}}
 .hdr .meta{{font-size:12px;color:#94a3b8;margin-top:4px;}}
-.badge{{padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;background:#3b82f6;color:#fff;}}
-.wrap{{max-width:1500px;margin:0 auto;padding:20px 28px;}}
-.kpi{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:20px;}}
-.kpi-c{{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:18px;text-align:center;}}
-.kpi-c .lbl{{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px;}}
-.kpi-c .val{{font-size:26px;font-weight:700;color:#f1f5f9;}}
-.kpi-c .sub{{font-size:11px;color:#64748b;margin-top:3px;}}
-.card{{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:20px;}}
-.sec-title{{font-size:15px;font-weight:700;color:#f1f5f9;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #334155;}}
-.charts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:18px;margin-bottom:20px;}}
-.ch-card{{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:18px;}}
-.ch-card h3{{font-size:13px;color:#94a3b8;margin-bottom:14px;}}
+.wrap{{max-width:1440px;margin:0 auto;padding:24px 28px;}}
+.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:24px;}}
+.kpi-c{{background:#131c2e;border:1px solid #1e293b;border-radius:10px;padding:16px;text-align:center;box-shadow:0 4px 6px -1px rgba(0,0,0,0.2);}}
+.kpi-c .lbl{{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;}}
+.kpi-c .val{{font-size:24px;font-weight:700;color:#f8fafc;}}
+.kpi-c .sub{{font-size:11px;color:#64748b;margin-top:2px;}}
+.card{{background:#131c2e;border:1px solid #1e293b;border-radius:10px;padding:20px;margin-bottom:24px;box-shadow:0 4px 6px -1px rgba(0,0,0,0.2);}}
+.sec-ttl{{font-size:15px;font-weight:700;color:#f8fafc;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;padding-bottom:8px;border-bottom:1px solid #1e293b;}}
+.tw{{overflow-x:auto;border-radius:8px;border:1px solid #1e293b;}}
 table{{width:100%;border-collapse:collapse;font-size:12px;}}
-th{{background:#0f172a;color:#64748b;padding:9px 11px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid #334155;position:sticky;top:0;z-index:1;}}
-td{{padding:9px 11px;border-bottom:1px solid #1e293b44;color:#e2e8f0;vertical-align:middle;}}
-tr:hover td{{background:#1e3a5f22;}}
+th{{background:#0b0f19;color:#94a3b8;padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid #1e293b;position:sticky;top:0;}}
+td{{padding:10px 12px;border-bottom:1px solid #1e293b66;color:#cbd5e1;}}
+tr:hover td{{background:#1e293b44;}}
 .tc{{text-align:center;}}
-.tw{{overflow-x:auto;border-radius:8px;border:1px solid #334155;}}
-.ins{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;}}
-.ins-c{{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:14px;}}
+.sum-box{{background:#0b0f19;border:1px solid #1e293b;border-radius:8px;padding:18px;font-size:13px;line-height:1.8;color:#cbd5e1;}}
+.charts{{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:18px;margin-bottom:24px;}}
+.ch-card{{background:#131c2e;border:1px solid #1e293b;border-radius:10px;padding:18px;}}
+.ch-card h3{{font-size:13px;color:#94a3b8;margin-bottom:12px;}}
+.ins{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;}}
+.ins-c{{background:#0b0f19;border:1px solid #1e293b;border-radius:8px;padding:14px;}}
 .ins-c .ttl{{font-size:13px;font-weight:700;margin-bottom:8px;}}
 .ins-c ul{{list-style:none;}}
-.ins-c ul li{{font-size:12px;color:#94a3b8;padding:3px 0;border-bottom:1px solid #1e293b33;}}
+.ins-c ul li{{font-size:12px;color:#94a3b8;padding:4px 0;border-bottom:1px solid #1e293b33;}}
 .ins-c ul li::before{{content:"→ ";color:#3b82f6;}}
-.rec{{display:flex;align-items:flex-start;gap:10px;padding:11px;background:#0f172a;border-radius:7px;margin-bottom:7px;border-left:3px solid;}}
-.risks{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;}}
-.risk-c{{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:14px;}}
-.risk-c h4{{font-size:12px;color:#94a3b8;margin-bottom:10px;}}
-.sum-box{{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:18px;font-size:13px;line-height:1.8;color:#cbd5e1;}}
+.rec{{display:flex;align-items:flex-start;gap:10px;padding:12px;background:#0b0f19;border-radius:7px;margin-bottom:8px;border-left:3px solid;}}
 .btn-link{{display:inline-block;background:#3b82f6;color:#fff;padding:9px 20px;border-radius:7px;text-decoration:none;font-weight:600;font-size:13px;}}
-code{{background:#0f172a;padding:2px 5px;border-radius:3px;font-size:11px;}}
+code{{background:#0b0f19;padding:2px 6px;border-radius:3px;font-size:11px;}}
 </style>
 </head>
 <body>
 
 <div class="hdr">
   <div>
-    <div style="display:flex;align-items:center;gap:10px;">
-      <h1>⚡ {TEST_NAME}</h1>
-      <span class="badge">{REPORT_MODE.upper()} MODE</span>
-      <span class="badge" style="background:#475569;">JMeter</span>
-    </div>
-    <div class="meta">Generated: {summary['generated_at']} &nbsp;|&nbsp; {summary['total']} Transactions &nbsp;|&nbsp; PetStore Application</div>
+    <h1>⚡ {TEST_NAME} <span style="background:#2563eb;color:#fff;font-size:11px;padding:2px 8px;border-radius:6px;">Automated Report</span></h1>
+    <div class="meta">Generated: {summary_dict['generated_at']} &nbsp;|&nbsp; {summary_dict['total']} Target Transactions &nbsp;|&nbsp; Simple Data Writer Feed</div>
   </div>
-  <div>{result_badge(res)}</div>
+  <div>{result_badge(summary_dict['overall_result'])}</div>
 </div>
 
 <div class="wrap">
 
 <!-- KPI CARDS -->
-<div class="kpi">
-  <div class="kpi-c"><div class="lbl">Transactions</div><div class="val">{summary['total']}</div></div>
-  <div class="kpi-c"><div class="lbl">✅ Passed</div><div class="val" style="color:#22c55e;">{summary['passed']}</div></div>
-  <div class="kpi-c"><div class="lbl">⚠️ Partial</div><div class="val" style="color:#f59e0b;">{summary['partial']}</div></div>
-  <div class="kpi-c"><div class="lbl">❌ Failed</div><div class="val" style="color:#ef4444;">{summary['failed']}</div></div>
-  <div class="kpi-c"><div class="lbl">Avg Response Time</div><div class="val">{summary['avg_rt']}</div><div class="sub">ms</div></div>
-  <div class="kpi-c"><div class="lbl">Avg TPH</div><div class="val">{summary['avg_tph']}</div><div class="sub">trans/hr</div></div>
-  <div class="kpi-c"><div class="lbl">Avg Error %</div><div class="val" style="color:{'#ef4444' if summary['avg_error_pct']>1 else '#22c55e'};">{summary['avg_error_pct']}%</div></div>
-  <div class="kpi-c"><div class="lbl">Perf Score</div><div class="val" style="color:{pc_col};">{pc}</div><div class="sub">Grade {pg} — {summary['perf_status']}</div></div>
-  <div class="kpi-c"><div class="lbl">Stability Score</div><div class="val" style="color:#3b82f6;">{sc}</div><div class="sub">{summary['stab_status']}</div></div>
+<div class="kpis">
+  <div class="kpi-c"><div class="lbl">Transactions</div><div class="val">{summary_dict['total']}</div><div class="sub">Total Analyzed</div></div>
+  <div class="kpi-c"><div class="lbl">Passed</div><div class="val" style="color:#22c55e;">{summary_dict['passed']}</div><div class="sub">Met SLA</div></div>
+  <div class="kpi-c"><div class="lbl">Partial Pass</div><div class="val" style="color:#f59e0b;">{summary_dict['partial']}</div><div class="sub">Warnings</div></div>
+  <div class="kpi-c"><div class="lbl">Failed</div><div class="val" style="color:#ef4444;">{summary_dict['failed']}</div><div class="sub">SLA Breached</div></div>
+  <div class="kpi-c"><div class="lbl">Avg Response Time</div><div class="val">{summary_dict['avg_rt']}</div><div class="sub">ms</div></div>
+  <div class="kpi-c"><div class="lbl">Total Hits</div><div class="val">{summary_dict['total_hits']}</div><div class="sub">Samples</div></div>
+  <div class="kpi-c"><div class="lbl">Avg Error %</div><div class="val" style="color:{'#ef4444' if summary_dict['avg_error_pct']>1 else '#22c55e'};">{summary_dict['avg_error_pct']}%</div><div class="sub">Error Rate</div></div>
+  <div class="kpi-c"><div class="lbl">Perf Score</div><div class="val" style="color:#3b82f6;">{summary_dict['perf_score']}</div><div class="sub">Grade {summary_dict['perf_grade']} ({summary_dict['perf_status']})</div></div>
+  <div class="kpi-c"><div class="lbl">Stability</div><div class="val" style="color:#a855f7;">{summary_dict['stab_score']}</div><div class="sub">{summary_dict['stab_status']}</div></div>
 </div>
 
-<!-- MANAGEMENT SUMMARY -->
+<!-- MANAGEMENT AI SUMMARY -->
 <div class="card">
-  <h2 class="sec-title">📋 Management Summary</h2>
+  <div class="sec-ttl"><span>📋 Management Executive Summary</span><span style="font-size:11px;color:#94a3b8;font-weight:400;">AI Synthesized</span></div>
   <div class="sum-box" id="ai-summary">Generating AI insights... please wait.</div>
 </div>
 
-<!-- SLA COMPARISON TABLE -->
+<!-- 01_ALL_TRANSACTIONS TABLE -->
 <div class="card">
-  <h2 class="sec-title">📊 SLA Comparison Table &nbsp;<span style="font-size:11px;color:#64748b;font-weight:400;">★ P90 is primary KPI &nbsp;|&nbsp; Sorted worst-first</span></h2>
+  <div class="sec-ttl"><span>📊 01 — All Transactions</span><span style="font-size:11px;color:#94a3b8;font-weight:400;">Full Latency & Error Distribution</span></div>
   <div class="tw">
     <table>
-      <thead><tr>
-        <th>Transaction</th><th>Target RT</th><th>Avg RT</th><th>P80</th>
-        <th>P90 ★</th><th>P95</th><th>Max RT</th><th>RT Status</th>
-        <th>Target TPH</th><th>Actual TPH</th><th>TPH Status</th>
-        <th>RT Ach%</th><th>TPH Ach%</th><th>Overall</th>
-      </tr></thead>
-      <tbody>{sla_rows}</tbody>
+      <thead>
+        <tr>
+          <th>Transaction</th>
+          <th class="tc">90% Line</th>
+          <th class="tc">80% Line</th>
+          <th class="tc">Avg</th>
+          <th class="tc">Min</th>
+          <th class="tc">Max</th>
+          <th class="tc">Hit Count</th>
+          <th class="tc">Errors</th>
+          <th class="tc">Error %</th>
+          <th class="tc">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_all}
+      </tbody>
     </table>
   </div>
 </div>
 
-<!-- ERROR TRANSACTION TABLE -->
+<!-- 02_TPH_NOT_ACHIEVED TABLE -->
 <div class="card">
-  <h2 class="sec-title">🔴 Error Transaction Table</h2>
+  <div class="sec-ttl"><span>🚀 02 — Throughput (TPH) Not Achieved</span><span style="font-size:11px;color:#f59e0b;font-weight:600;">AMBER & RED Only</span></div>
   <div class="tw">
     <table>
-      <thead><tr>
-        <th>Transaction</th><th>Code</th><th>Response Message</th>
-        <th>Failure Message</th><th>Count</th><th>Error %</th><th>Impact</th>
-      </tr></thead>
-      <tbody>{err_rows}</tbody>
+      <thead>
+        <tr>
+          <th>Transaction</th>
+          <th class="tc">90% Line</th>
+          <th class="tc">Hit Count</th>
+          <th class="tc">Target TPH</th>
+          <th class="tc">TPH % Achieved</th>
+          <th class="tc">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_tph}
+      </tbody>
     </table>
   </div>
 </div>
 
-<!-- RT EXCEPTIONS -->
+<!-- 03_SLA_90PCT_DEVIATION TABLE -->
 <div class="card">
-  <h2 class="sec-title">⏱️ Response Time Exceptions &nbsp;<span style="font-size:11px;color:#64748b;font-weight:400;">RED + AMBER — ranked by worst deviation</span></h2>
+  <div class="sec-ttl"><span>⏱️ 03 — SLA 90th Percentile Deviation</span><span style="font-size:11px;color:#ef4444;font-weight:600;">AMBER & RED Only</span></div>
   <div class="tw">
     <table>
-      <thead><tr>
-        <th>Transaction</th><th>Target RT</th><th>P90 Actual</th><th>Gap</th>
-        <th>Achievement%</th><th>Status</th><th>Reason</th><th>Action</th>
-      </tr></thead>
-      <tbody>{rt_exc}</tbody>
+      <thead>
+        <tr>
+          <th>Transaction</th>
+          <th class="tc">90% Actual</th>
+          <th class="tc">80% Actual</th>
+          <th class="tc">Avg Actual</th>
+          <th class="tc">Target SLA</th>
+          <th class="tc">Deviation %</th>
+          <th class="tc">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_sla}
+      </tbody>
     </table>
   </div>
 </div>
 
-<!-- TPH EXCEPTIONS -->
+<!-- 04_ERROR_TRANSACTIONS TABLE -->
 <div class="card">
-  <h2 class="sec-title">🚀 Throughput Exceptions &nbsp;<span style="font-size:11px;color:#64748b;font-weight:400;">RED + AMBER — ranked by worst deviation</span></h2>
+  <div class="sec-ttl"><span>🔴 04 — Error Transactions</span><span style="font-size:11px;color:#f87171;font-weight:400;">Grouped by Time & Code</span></div>
   <div class="tw">
     <table>
-      <thead><tr>
-        <th>Transaction</th><th>Target TPH</th><th>Actual TPH</th><th>Gap</th>
-        <th>Achievement%</th><th>Status</th><th>Reason</th><th>Action</th>
-      </tr></thead>
-      <tbody>{tph_exc}</tbody>
+      <thead>
+        <tr>
+          <th class="tc">Timestamp</th>
+          <th>Transaction</th>
+          <th class="tc">Response Code</th>
+          <th class="tc">Fail Count</th>
+          <th class="tc">Fail %</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows_err}
+      </tbody>
     </table>
   </div>
 </div>
 
-<!-- TOP RISKS -->
-<div class="card">
-  <h2 class="sec-title">⚠️ Top Performance Risks</h2>
-  <div class="risks">
-    <div class="risk-c">
-      <h4>🐢 Top 5 Slowest (P90)</h4>
-      <table><thead><tr><th>#</th><th>Transaction</th><th>P90</th><th>Status</th></tr></thead>
-      <tbody>{risk_rows(top5s,'p90_rt','ms')}</tbody></table>
-    </div>
-    <div class="risk-c">
-      <h4>📉 Top 5 TPH Underachievers</h4>
-      <table><thead><tr><th>#</th><th>Transaction</th><th>Ach%</th><th>Status</th></tr></thead>
-      <tbody>{risk_rows(top5t,'tph_ach_pct','%')}</tbody></table>
-    </div>
-    <div class="risk-c">
-      <h4>💥 Top 5 Highest Error Rate</h4>
-      <table><thead><tr><th>#</th><th>Transaction</th><th>Err%</th><th>Status</th></tr></thead>
-      <tbody>{risk_rows(top5e,'error_pct','%')}</tbody></table>
-    </div>
-  </div>
-</div>
-
-<!-- CHARTS -->
+<!-- CHARTS GRID -->
 <div class="charts">
-  <div class="ch-card"><h3>Pass / Partial / Fail</h3><canvas id="cDonut" height="200"></canvas></div>
-  <div class="ch-card"><h3>Response Time Status</h3><canvas id="cRT" height="200"></canvas></div>
-  <div class="ch-card"><h3>Throughput Status</h3><canvas id="cTPH" height="200"></canvas></div>
-  <div class="ch-card"><h3>Top 10 Slowest (P90 ms)</h3><canvas id="cSlow" height="200"></canvas></div>
-  <div class="ch-card"><h3>Top 10 TPH Achievement %</h3><canvas id="cTPHAch" height="200"></canvas></div>
-  <div class="ch-card"><h3>Error % by Transaction</h3><canvas id="cErr" height="200"></canvas></div>
+  <div class="ch-card">
+    <h3>Pass / Partial / Fail Distribution</h3>
+    <canvas id="cDonut" height="220"></canvas>
+  </div>
+  <div class="ch-card">
+    <h3>P90 Response Time (ms) by Transaction</h3>
+    <canvas id="cRT" height="220"></canvas>
+  </div>
+  <div class="ch-card">
+    <h3>TPH Achievement % by Transaction</h3>
+    <canvas id="cTPH" height="220"></canvas>
+  </div>
+  <div class="ch-card">
+    <h3>Error % by Transaction</h3>
+    <canvas id="cErr" height="220"></canvas>
+  </div>
 </div>
 
 <!-- AI INSIGHTS -->
 <div class="card">
-  <h2 class="sec-title">🤖 AI Insights</h2>
+  <div class="sec-ttl"><span>🤖 AI In-Depth Analysis</span><span style="font-size:11px;color:#94a3b8;font-weight:400;">Anthropic Claude</span></div>
+  <!-- AI-INSIGHTS-START -->
   <div class="ins" id="ai-insights">
-    <div class="ins-c"><div class="ttl" style="color:#3b82f6;">🔍 Key Findings</div><ul><li>Pending AI analysis...</li></ul></div>
-    <div class="ins-c"><div class="ttl" style="color:#ef4444;">🚨 Critical Issues</div><ul><li>Pending AI analysis...</li></ul></div>
-    <div class="ins-c"><div class="ttl" style="color:#f59e0b;">⚠️ Performance Risks</div><ul><li>Pending AI analysis...</li></ul></div>
-    <div class="ins-c"><div class="ttl" style="color:#22c55e;">✅ Positive Improvements</div><ul><li>Pending AI analysis...</li></ul></div>
-    <div class="ins-c"><div class="ttl" style="color:#a78bfa;">🔎 Areas of Concern</div><ul><li>Pending AI analysis...</li></ul></div>
+    <div class="ins-c"><div class="ttl" style="color:#3b82f6;">🔍 Key Findings</div><ul><li>Analysis pending...</li></ul></div>
+    <div class="ins-c"><div class="ttl" style="color:#ef4444;">🚨 Critical Issues</div><ul><li>Analysis pending...</li></ul></div>
+    <div class="ins-c"><div class="ttl" style="color:#f59e0b;">⚠️ Performance Risks</div><ul><li>Analysis pending...</li></ul></div>
+    <div class="ins-c"><div class="ttl" style="color:#22c55e;">✅ Positive Improvements</div><ul><li>Analysis pending...</li></ul></div>
+    <div class="ins-c"><div class="ttl" style="color:#a78bfa;">🔎 Areas of Concern</div><ul><li>Analysis pending...</li></ul></div>
   </div>
+  <!-- AI-INSIGHTS-END -->
 </div>
 
 <!-- RECOMMENDATIONS -->
 <div class="card">
-  <h2 class="sec-title">💡 Recommendations</h2>
+  <div class="sec-ttl"><span>💡 Prioritized Recommendations</span><span style="font-size:11px;color:#94a3b8;font-weight:400;">Actionable Next Steps</span></div>
+  <!-- AI-RECS-START -->
   <div id="ai-recs">
-    <div class="rec" style="border-color:#ef4444;"><span>🔴</span><div><strong style="color:#ef4444;">Critical Priority</strong><br><span style="color:#94a3b8;font-size:12px;">Pending AI analysis...</span></div></div>
+    <div class="rec" style="border-color:#ef4444;"><span>🔴</span><div><strong style="color:#ef4444;">Critical Priority</strong><br><span style="color:#94a3b8;font-size:12px;">Recommendations pending...</span></div></div>
   </div>
+  <!-- AI-RECS-END -->
 </div>
 
-{grafana_html}
+{grafana_block}
 
-<div style="text-align:center;padding:20px;color:#475569;font-size:11px;border-top:1px solid #334155;margin-top:20px;">
-  Performance Analytics Dashboard &nbsp;|&nbsp; {TEST_NAME} &nbsp;|&nbsp; {summary['generated_at']} &nbsp;|&nbsp; JMeter + Claude AI
+<div style="text-align:center;padding:24px 0;color:#64748b;font-size:11px;border-top:1px solid #1e293b;margin-top:20px;">
+  Automated Performance Reporting Pipeline &nbsp;|&nbsp; {TEST_NAME} &nbsp;|&nbsp; {summary_dict['generated_at']}
 </div>
+
 </div>
 
 <script>
-const CD = {{plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:10}}}}}}}},scales:{{x:{{ticks:{{color:'#64748b'}},grid:{{color:'#1e293b'}}}},y:{{ticks:{{color:'#64748b'}},grid:{{color:'#1e293b'}}}}}}}};
-new Chart(document.getElementById('cDonut'),{{type:'doughnut',data:{{labels:['Passed','Partial','Failed'],datasets:[{{data:[{passed},{partial},{failed}],backgroundColor:['#22c55e','#f59e0b','#ef4444'],borderWidth:0}}]}},options:{{plugins:{{legend:{{labels:{{color:'#94a3b8'}}}}}}}}}});
-new Chart(document.getElementById('cRT'),{{type:'bar',data:{{labels:['GREEN','AMBER','RED'],datasets:[{{data:[{rt_g},{rt_a},{rt_r}],backgroundColor:['#22c55e','#f59e0b','#ef4444'],borderRadius:5}}]}},options:{{...CD,plugins:{{legend:{{display:false}}}}}}}});
-new Chart(document.getElementById('cTPH'),{{type:'bar',data:{{labels:['GREEN','AMBER','RED'],datasets:[{{data:[{tp_g},{tp_a},{tp_r}],backgroundColor:['#22c55e','#f59e0b','#ef4444'],borderRadius:5}}]}},options:{{...CD,plugins:{{legend:{{display:false}}}}}}}});
-new Chart(document.getElementById('cSlow'),{{type:'bar',data:{{labels:{js_labels(top10s)},datasets:[{{label:'P90 ms',data:{js_vals(top10s,'p90_rt')},backgroundColor:'#3b82f6',borderRadius:4}}]}},options:{{indexAxis:'y',...CD}}}});
-new Chart(document.getElementById('cTPHAch'),{{type:'bar',data:{{labels:{js_labels(top10ta)},datasets:[{{label:'Ach%',data:{js_vals(top10ta,'tph_ach_pct')},backgroundColor:'#a78bfa',borderRadius:4}}]}},options:{{indexAxis:'y',...CD}}}});
-new Chart(document.getElementById('cErr'),{{type:'bar',data:{{labels:{js_labels(sorted(trx,key=lambda x:x['error_pct'],reverse=True)[:10])},datasets:[{{label:'Error%',data:{js_vals(sorted(trx,key=lambda x:x['error_pct'],reverse=True)[:10],'error_pct')},backgroundColor:'#f43f5e',borderRadius:4}}]}},options:{{...CD,plugins:{{legend:{{display:false}}}}}}}});
+const commonCfg = {{
+  plugins: {{
+    legend: {{ labels: {{ color: '#94a3b8', font: {{ size: 10 }} }} }}
+  }},
+  scales: {{
+    x: {{ ticks: {{ color: '#64748b', font: {{ size: 10 }} }}, grid: {{ color: '#1e293b' }} }},
+    y: {{ ticks: {{ color: '#64748b', font: {{ size: 10 }} }}, grid: {{ color: '#1e293b' }} }}
+  }}
+}};
+
+new Chart(document.getElementById('cDonut'), {{
+  type: 'doughnut',
+  data: {{
+    labels: ['Passed', 'Partial', 'Failed'],
+    datasets: [{{
+      data: [{summary_dict['passed']}, {summary_dict['partial']}, {summary_dict['failed']}],
+      backgroundColor: ['#22c55e', '#f59e0b', '#ef4444'],
+      borderWidth: 0
+    }}]
+  }},
+  options: {{
+    plugins: {{ legend: {{ labels: {{ color: '#94a3b8' }} }} }}
+  }}
+}});
+
+new Chart(document.getElementById('cRT'), {{
+  type: 'bar',
+  data: {{
+    labels: {chart_tx_labels},
+    datasets: [{{
+      label: 'P90 ms',
+      data: {chart_p90_vals},
+      backgroundColor: '#3b82f6',
+      borderRadius: 4
+    }}]
+  }},
+  options: {{ indexAxis: 'y', ...commonCfg }}
+}});
+
+new Chart(document.getElementById('cTPH'), {{
+  type: 'bar',
+  data: {{
+    labels: {chart_tx_labels},
+    datasets: [{{
+      label: 'TPH Achieved %',
+      data: {chart_tph_vals},
+      backgroundColor: '#a855f7',
+      borderRadius: 4
+    }}]
+  }},
+  options: {{ indexAxis: 'y', ...commonCfg }}
+}});
+
+new Chart(document.getElementById('cErr'), {{
+  type: 'bar',
+  data: {{
+    labels: {chart_tx_labels},
+    datasets: [{{
+      label: 'Error %',
+      data: {chart_err_vals},
+      backgroundColor: '#ef4444',
+      borderRadius: 4
+    }}]
+  }},
+  options: {{ indexAxis: 'y', ...commonCfg }}
+}});
 </script>
-</body></html>"""
+</body>
+</html>"""
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Main Entrypoint ───────────────────────────────────────────────────────────
 def main():
-    print(f"[generate_dashboard] Aggregate : {AGGREGATE_REPORT}")
-    print(f"[generate_dashboard] Errors    : {ERROR_LOG}")
-    print(f"[generate_dashboard] SLA       : {SLA_FILE}")
+    input_file = find_input_file()
+    print(f"[generate_dashboard] Input File : {input_file}")
+    print(f"[generate_dashboard] SLA File   : {SLA_FILE}")
+    print(f"[generate_dashboard] Output Dir : {OUTPUT_DIR}")
 
-    agg_df    = parse_aggregate(AGGREGATE_REPORT)
-    errors_df = parse_errors(ERROR_LOG)
-    sla       = parse_sla(SLA_FILE)
-    trx       = build_transactions(agg_df, sla)
+    sla_map = load_sla(SLA_FILE)
+    summary_df, tph, sla_dev, failures_summary = process_data(input_file, sla_map, OUTPUT_DIR)
 
-    ps, pg, pst = perf_score(trx)
-    ss, sst     = stab_score(trx)
-    res         = overall_result(trx)
-    n           = len(trx)
+    tx_detail, res, ps, pg, pst, ss, sst, passed, partial, failed = evaluate_performance(
+        summary_df, tph, sla_dev, sla_map
+    )
 
-    summary = {
-        "test_name": TEST_NAME, "report_mode": REPORT_MODE,
+    avg_rt = round(summary_df["avg"].mean(), 1) if not summary_df.empty else 0.0
+    tot_hits = int(summary_df["hitcount"].sum()) if not summary_df.empty else 0
+    avg_err = round(summary_df["error_pct"].mean(), 2) if not summary_df.empty else 0.0
+
+    summary_dict = {
+        "test_name": TEST_NAME,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "grafana_url": GRAFANA_URL,
-        "total": n, "passed": sum(1 for t in trx if t["overall_status"]=="GREEN"),
-        "partial": sum(1 for t in trx if t["overall_status"]=="AMBER"),
-        "failed":  sum(1 for t in trx if t["overall_status"]=="RED"),
-        "avg_rt":  round(sum(t["avg_rt"] for t in trx)/n,1) if n else 0,
-        "avg_tph": round(sum(t["tph"] for t in trx)/n,1)    if n else 0,
-        "avg_error_pct": round(sum(t["error_pct"] for t in trx)/n,2) if n else 0,
-        "perf_score": ps, "perf_grade": pg, "perf_status": pst,
-        "stab_score": ss, "stab_status": sst, "overall_result": res,
-        "top_failed": [t for t in trx if t["overall_status"]=="RED"][:3],
-        "transactions": trx,
+        "total": len(tx_detail),
+        "passed": passed,
+        "partial": partial,
+        "failed": failed,
+        "avg_rt": avg_rt,
+        "total_hits": tot_hits,
+        "avg_error_pct": avg_err,
+        "perf_score": ps,
+        "perf_grade": pg,
+        "perf_status": pst,
+        "stab_score": ss,
+        "stab_status": sst,
+        "overall_result": res,
+        "all_transactions": tx_detail,
+        "tph_not_achieved": [
+            {"name": r[0], "p90": r[1], "hitcount": r[2], "tph_ach_pct": r[3], "target_tph": r[4], "status": r[5]}
+            for r in tph
+        ],
+        "sla_90pct_deviation": [
+            {"name": r[0], "p90": r[1], "p80": r[2], "avg": r[3], "deviation_pct": r[4], "target_resp": r[5], "status": r[6]}
+            for r in sla_dev
+        ],
+        "error_transactions": failures_summary.to_dict(orient="records")
     }
 
-    with open(f"{OUTPUT_DIR}/summary.json","w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"[generate_dashboard] summary.json saved")
+    # Save summary.json
+    summary_json_path = f"{OUTPUT_DIR}/summary.json"
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump(summary_dict, f, indent=2)
+    print(f"[generate_dashboard] Saved: {summary_json_path}")
 
-    html = build_html(summary, trx, errors_df)
-    with open(f"{OUTPUT_DIR}/dashboard.html","w") as f:
+    # Build & save dashboard.html
+    html = build_dashboard_html(summary_dict)
+    dash_path = f"{OUTPUT_DIR}/dashboard.html"
+    with open(dash_path, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"[generate_dashboard] dashboard.html saved")
-    print(f"[generate_dashboard] Result : {res} | Score : {ps} ({pg}) | Stability : {ss}")
+    print(f"[generate_dashboard] Saved: {dash_path}")
+    print(f"[generate_dashboard] Result: {res} | Score: {ps} ({pg}) | Stability: {ss}")
+
 
 if __name__ == "__main__":
     main()

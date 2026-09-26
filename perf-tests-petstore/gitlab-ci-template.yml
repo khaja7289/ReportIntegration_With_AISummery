@@ -42,15 +42,13 @@ variables:
   # ── JMeter Result Paths (must match listener config in JMX) ──────────────
   RESULTS_DIR:          "artifacts/results"
   REPORTS_DIR:          "artifacts/reports"
+  SDW_REPORT:           "artifacts/results/sdw.csv"
   AGGREGATE_REPORT:     "artifacts/results/aggregate_report.csv"
   ERROR_LOG:            "artifacts/results/errors.csv"
   OUTPUT_DIR:           "artifacts/reports"
 
   # ── SLA Config ────────────────────────────────────────────────────────────
   SLA_FILE:             "config/sla.json"
-
-  # ── Report Mode ───────────────────────────────────────────────────────────
-  REPORT_MODE:          "sla"             # sla | baseline
 
   # ── Pipeline Behaviour ────────────────────────────────────────────────────
   FAIL_PIPELINE_ON_FAIL: "true"          # true = block merge on FAIL result
@@ -60,6 +58,9 @@ variables:
   INSTALL_MONITORING_TOOLS: "false"
   BACKEND_LISTENER_JAR_URL: ""
   INSTALL_JMETER_PLUGINS: "true"
+
+  # ── AI Reporting Microservice ─────────────────────────────────────────────
+  AI_SERVICE_URL:       ""               # e.g. "http://your-fastapi-host:8000" (leave blank to use fallback)
 
   # ── Artifact Retention ────────────────────────────────────────────────────
   ARTIFACT_EXPIRE:      "30 days"

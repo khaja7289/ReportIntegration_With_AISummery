@@ -79,6 +79,7 @@ run-test:
         -JRampup="$RAMPUP" \
         -JTestDuration="$TEST_DURATION" \
         -JRESULTS_DIR="$RESULTS_DIR" \
+        -JSDW_REPORT="$SDW_REPORT" \
         -JAGGREGATE_REPORT="$AGGREGATE_REPORT" \
         -JERROR_LOG="$ERROR_LOG" \
         -Jjmeter.save.saveservice.output_format=csv \
@@ -108,18 +109,19 @@ generate-report:
     - export RESULTS_DIR="${RESULTS_DIR:-artifacts/results}"
     - export REPORTS_DIR="${REPORTS_DIR:-artifacts/reports}"
     - mkdir -p "$REPORTS_DIR"
-    - echo "[pipeline] Generating dashboard..."
+    - echo "[pipeline] Generating dashboard and 4 structured KPI tables..."
     - |
+      SDW_REPORT="${SDW_REPORT:-$RESULTS_DIR/sdw.csv}" \
       AGGREGATE_REPORT="$AGGREGATE_REPORT" \
       ERROR_LOG="$ERROR_LOG" \
       SLA_FILE="$SLA_FILE" \
       TEST_NAME="$TEST_NAME" \
-      REPORT_MODE="$REPORT_MODE" \
       GRAFANA_URL="$GRAFANA_URL" \
       OUTPUT_DIR="$REPORTS_DIR" \
       python3 "$FRAMEWORK_DIR/generate_dashboard.py"
-    - echo "[pipeline] Injecting AI insights..."
+    - echo "[pipeline] Injecting AI insights from FastAPI service..."
     - |
+      AI_SERVICE_URL="$AI_SERVICE_URL" \
       ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
       OUTPUT_DIR="$REPORTS_DIR" \
       TEST_NAME="$TEST_NAME" \
